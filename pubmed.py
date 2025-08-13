@@ -4,8 +4,9 @@ This script connects to the NCBI server via HTTP and downloads all PubMed
 baseline data files (.xml.gz) for a given year to a user-specified 
 local directory.
 
-It checks for existing files to avoid re-downloading and uses a thread 
-pool for concurrent, faster downloads with a tqdm progress bar.
+It performs MD5 checksum validation to ensure file integrity, checks for 
+existing files to avoid re-downloading, and uses a thread pool for 
+concurrent, faster downloads with a tqdm progress bar.
 """
 
 import os
@@ -13,57 +14,77 @@ import sys
 import requests
 from tqdm import tqdm
 import concurrent.futures
+import hashlib
 
-def download_file(url, local_filepath):
+def calculate_md5(filepath, block_size=65536):
+    """Calculates the MD5 hash of a file."""
+    md5 = hashlib.md5()
+    try:
+        with open(filepath, 'rb') as f:
+            while True:
+                data = f.read(block_size)
+                if not data:
+                    break
+                md5.update(data)
+    except IOError:
+        return None
+    return md5.hexdigest()
+
+def verify_and_download_file(filename, download_dir, base_url):
     """
-    Downloads a single file from a URL to a local path.
-    Designed to be run in a separate thread.
-
-    Args:
-        url (str): The URL of the file to download.
-        local_filepath (str): The local path to save the file to.
+    Manages the download and verification for a single file.
+    Checks existing files and verifies new downloads against MD5 checksums.
     
     Returns:
-        str: The path of the downloaded file if successful, otherwise None.
+        str: Status ('success', 'skipped_verified', 'failed').
+        str: The filename processed.
     """
+    local_filepath = os.path.join(download_dir, filename)
+    url = base_url + filename
+    md5_url = url + ".md5"
+
     try:
-        # Use streaming to handle large files without loading them all into memory
+        # --- Get Official MD5 Checksum ---
+        md5_response = requests.get(md5_url, timeout=30)
+        md5_response.raise_for_status()
+        official_hash = md5_response.text.split('=')[1].strip()
+
+        # --- Check if file exists and is valid ---
+        if os.path.exists(local_filepath):
+            local_hash = calculate_md5(local_filepath)
+            if local_hash == official_hash:
+                return 'skipped_verified', filename
+            else:
+                tqdm.write(f"MD5 mismatch for existing file {filename}. Deleting and redownloading.")
+                os.remove(local_filepath)
+
+        # --- Download the file ---
         response = requests.get(url, stream=True, timeout=60)
-        response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
-
-        total_size_in_bytes = int(response.headers.get('content-length', 0))
-        block_size = 8192 # 8 Kibibytes for faster writing
-
-        # Extract filename for the progress bar description
-        filename = os.path.basename(local_filepath)
-
-        with open(local_filepath, 'wb') as file, tqdm(
-            desc=filename,
-            total=total_size_in_bytes,
-            unit='iB',
-            unit_scale=True,
-            unit_divisor=1024,
-            leave=False # Hides the bar when done
-        ) as progress_bar:
-            for data in response.iter_content(block_size):
-                progress_bar.update(len(data))
+        response.raise_for_status()
+        total_size = int(response.headers.get('content-length', 0))
+        
+        with open(local_filepath, 'wb') as file:
+            for data in response.iter_content(chunk_size=8192):
                 file.write(data)
         
-        # Check if the download was complete
-        if total_size_in_bytes != 0 and progress_bar.n != total_size_in_bytes:
-            raise Exception("Incomplete download")
-            
-        return local_filepath
+        # --- Verify the newly downloaded file ---
+        if os.path.getsize(local_filepath) != total_size:
+             raise Exception("Incomplete download (size mismatch)")
 
-    except requests.exceptions.RequestException as e:
-        # Clean up partial file on error
+        new_local_hash = calculate_md5(local_filepath)
+        if new_local_hash == official_hash:
+            return 'success', filename
+        else:
+            raise Exception(f"MD5 mismatch after download. Expected {official_hash}, got {new_local_hash}")
+
+    except Exception as e:
+        tqdm.write(f"Error processing {filename}: {e}")
         if os.path.exists(local_filepath):
-            os.remove(local_filepath)
-        # We print the error in the main loop, so we just return None here
-        return None
+            os.remove(local_filepath) # Clean up partial/corrupt file
+        return 'failed', filename
 
 
-def download_all_pubmed_baseline_files(download_dir, year=2025, max_workers=10):
+def download_all_pubmed_baseline_files(download_dir, year=2025, max_workers=10, max_retries=3):
     """
     Downloads all PubMed baseline files for a given year from the NCBI server using HTTP.
 
@@ -71,9 +92,8 @@ def download_all_pubmed_baseline_files(download_dir, year=2025, max_workers=10):
         download_dir (str): The full path to the local directory to save files in.
         year (int): The baseline year to download (e.g., 2025).
         max_workers (int): The maximum number of concurrent download threads.
+        max_retries (int): The number of times to retry downloading failed files.
     """
-    # --- Step 1: Validate the download directory ---
-    # Create the directory if it doesn't exist, which is more user-friendly.
     if not os.path.exists(download_dir):
         print(f"Directory '{download_dir}' not found. Creating it.")
         os.makedirs(download_dir)
@@ -81,58 +101,42 @@ def download_all_pubmed_baseline_files(download_dir, year=2025, max_workers=10):
         print(f"Error: The provided path '{download_dir}' exists but is not a directory.")
         sys.exit(1)
 
-    # --- Step 2: Generate the list of potential URLs to download ---
     year_prefix = str(year)[-2:] 
     base_url = "https://ftp.ncbi.nlm.nih.gov/pubmed/baseline/"
     num_files_to_try = 1250 
-    all_possible_files = [f"pubmed{year_prefix}n{i:04d}.xml.gz" for i in range(1, num_files_to_try + 1)]
+    files_to_process = [f"pubmed{year_prefix}n{i:04d}.xml.gz" for i in range(1, num_files_to_try + 1)]
     
-    # --- Step 3: Check for existing files and filter the download list ---
-    print(f"Checking for existing files in '{os.path.abspath(download_dir)}'...")
-    try:
-        existing_files = set(os.listdir(download_dir))
-        print(f"Found {len(existing_files)} files locally.")
-    except FileNotFoundError:
-        existing_files = set()
+    for attempt in range(max_retries):
+        if not files_to_process:
+            print("All files have been successfully downloaded and verified.")
+            break
 
-    files_to_download = [f for f in all_possible_files if f not in existing_files]
-    skipped_count = len(all_possible_files) - len(files_to_download)
-
-    if skipped_count > 0:
-        print(f"Skipping {skipped_count} files that are already downloaded.")
-    
-    total_files = len(files_to_download)
-    if total_files == 0:
-        print("\nAll baseline files for this year appear to be downloaded. Nothing to do.")
-        return
+        print(f"\n--- Attempt {attempt + 1} of {max_retries} ---")
+        print(f"Processing {len(files_to_process)} files...")
         
-    print(f"\nPreparing to download {total_files} new files for the {year} baseline.")
+        failed_files = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_filename = {
+                executor.submit(verify_and_download_file, filename, download_dir, base_url): filename
+                for filename in files_to_process
+            }
 
-    # --- Step 4: Confirmation before starting the large download ---
-    confirm = input(f"This can be hundreds of gigabytes. Are you sure you want to continue? (y/n): ")
-    if confirm.lower() != 'y':
-        print("Download cancelled by user.")
-        return
+            for future in tqdm(concurrent.futures.as_completed(future_to_filename), total=len(files_to_process), desc="Overall Progress"):
+                status, filename = future.result()
+                if status == 'failed':
+                    failed_files.append(filename)
+        
+        files_to_process = sorted(failed_files)
 
-    # --- Step 5: Download files using a thread pool ---
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_url = {
-            executor.submit(download_file, base_url + filename, os.path.join(download_dir, filename)): filename
-            for filename in files_to_download
-        }
-
-        for future in tqdm(concurrent.futures.as_completed(future_to_url), total=total_files, desc="Overall Progress", unit="file"):
-            filename = future_to_url[future]
-            try:
-                result = future.result()
-                if result is None:
-                    pass
-            except Exception as exc:
-                tqdm.write(f'\n{filename} generated an exception: {exc}')
-
-
-    print("\n\n--- Download process finished! ---")
-    print(f"All files saved in: {os.path.abspath(download_dir)}")
+    if files_to_process:
+        print("\n--- Download process finished with errors ---")
+        print("The following files could not be downloaded or verified:")
+        for f in files_to_process:
+            print(f"- {f}")
+    else:
+        print("\n\n--- Download process finished successfully! ---")
+        print(f"All files saved and verified in: {os.path.abspath(download_dir)}")
 
 
 # --- Main execution block ---
@@ -142,7 +146,8 @@ if __name__ == "__main__":
     download_all_pubmed_baseline_files(
         download_dir=download_path,
         year=2025,
-        max_workers=10
+        max_workers=10,
+        max_retries=3
     )
 
     print("\n--- Next Steps ---")
