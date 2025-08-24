@@ -17,7 +17,7 @@ def parse_pubmed_file(file_path):
         file_path (str): Path to the XML file (can be gzipped)
         
     Returns:
-        list: article_data
+        tuple: (article_data, file_path)
     """
     
     # Parse article data
@@ -38,7 +38,7 @@ def parse_pubmed_file(file_path):
                 # Add PMID to each grant record for reference
                 grant['pmid'] = pmid
     
-    return article_data
+    return article_data, file_path
 
 def process_publication_data(raw_data: dict, remove_title_brackets: bool = False) -> dict:
     """
@@ -140,11 +140,11 @@ def main():
     input_directory = "/Users/gopinath.balu/Workspace/agentic_ai_innovations/pubmed_baseline2025"
     
     # Define output files
-    output_dir = Path("/Users/gopinath.balu/Workspace/agentic_ai_innovations")
-    article_output = output_dir / "pubmed_articles.json"
+    output_dir = Path("/Users/gopinath.balu/Workspace/agentic_ai_innovations/intermediate_parsed/")
+    article_output = output_dir / "pubmed_articles_full.json"
     
     # Testing mode flag - set to True to process only a few files
-    testing_mode = True
+    testing_mode = False
     test_file_count = 2  # Number of files to process in testing mode
     
     # Configure number of workers for concurrent processing
@@ -182,7 +182,7 @@ def main():
     # Callback function to process results from each worker
     def process_result(future):
         try:
-            articles = future.result()
+            articles, file_path = future.result()
             with lock:
                 # Process each article with the cleanup function
                 for article in articles:
@@ -190,6 +190,13 @@ def main():
                     if processed:  # Only add if processing was successful
                         pmid = next(iter(processed))  # Get the PMID key
                         processed_articles[pmid] = processed[pmid]
+                
+                # Delete the file after successful processing
+                try:
+                    os.remove(file_path)
+                    # print(f"Deleted {file_path} to save disk space")
+                except Exception as e:
+                    print(f"Warning: Failed to delete {file_path}: {e}")
                 
                 pbar.update(1)
         except Exception as e:
