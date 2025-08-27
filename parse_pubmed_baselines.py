@@ -141,7 +141,7 @@ def main():
     
     # Define output files
     output_dir = Path("/Users/gopinath.balu/Workspace/agentic_ai_innovations/intermediate_parsed/")
-    article_output = output_dir / "pubmed_articles_full.json"
+    output_dir.mkdir(parents=True, exist_ok=True)  # Ensure the output directory exists
     
     # Testing mode flag - set to True to process only a few files
     testing_mode = False
@@ -150,6 +150,7 @@ def main():
     # Configure number of workers for concurrent processing
     # Use a reasonable number based on CPU cores (typically 2-4x number of cores for I/O bound tasks)
     max_workers = os.cpu_count() * 2
+    batch_size = max_workers  # Each batch will have the same size as the number of workers
     
     # Find all xml.gz files in the input directory
     xml_files = list(Path(input_directory).glob('*.xml.gz'))
@@ -165,64 +166,90 @@ def main():
     else:
         print(f"Found {len(xml_files)} XML files to process with {max_workers} workers")
     
-    # Thread-safe list to store all articles
-    all_articles = []
-    processed_articles = {}  # Dictionary to store cleaned articles keyed by PMID
-    lock = threading.Lock()
+    # Split files into batches
+    total_files = len(xml_files)
+    num_batches = (total_files + batch_size - 1) // batch_size  # Ceiling division
     
-    # Progress bar setup
-    pbar = tqdm(
-        total=len(xml_files),
-        desc="Processing PubMed files",
-        unit="file",
-        ncols=100,
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
-    )
+    print(f"Processing {total_files} files in {num_batches} batches of size {batch_size}")
     
-    # Callback function to process results from each worker
-    def process_result(future):
-        try:
-            articles, file_path = future.result()
-            with lock:
-                # Process each article with the cleanup function
-                for article in articles:
-                    processed = process_publication_data(article, remove_title_brackets=True)
-                    if processed:  # Only add if processing was successful
-                        pmid = next(iter(processed))  # Get the PMID key
-                        processed_articles[pmid] = processed[pmid]
-                
-                # Delete the file after successful processing
-                try:
-                    os.remove(file_path)
-                    # print(f"Deleted {file_path} to save disk space")
-                except Exception as e:
-                    print(f"Warning: Failed to delete {file_path}: {e}")
-                
-                pbar.update(1)
-        except Exception as e:
-            print(f"Error processing a file: {e}")
-            pbar.update(1)
+    total_processed_count = 0
     
-    # Use ThreadPoolExecutor for concurrent processing
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks to the executor
-        futures = []
-        for xml_file in xml_files:
-            future = executor.submit(parse_pubmed_file, str(xml_file))
-            future.add_done_callback(process_result)
-            futures = futures + [future]
+    # Process files in batches
+    for batch_num in range(num_batches):
+        start_idx = batch_num * batch_size
+        end_idx = min((batch_num + 1) * batch_size, total_files)
+        batch_files = xml_files[start_idx:end_idx]
         
-        # Wait for all tasks to complete (this is already handled by the context manager)
-        # but we'll use concurrent.futures.as_completed to ensure all callbacks finish
-        for _ in concurrent.futures.as_completed(futures):
-            pass
+        print(f"\nProcessing batch {batch_num + 1}/{num_batches} with {len(batch_files)} files")
+        
+        # Thread-safe dictionary to store articles for this batch
+        processed_articles = {}
+        lock = threading.Lock()
+        
+        # Progress bar setup for this batch
+        pbar = tqdm(
+            total=len(batch_files),
+            desc=f"Batch {batch_num + 1}/{num_batches}",
+            unit="file",
+            ncols=100,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+        )
+        
+        # List to keep track of completed futures
+        completed_futures = []
+        
+        # Callback function to process results from each worker
+        def process_result(future):
+            try:
+                articles, file_path = future.result()
+                with lock:
+                    # Process each article with the cleanup function
+                    for article in articles:
+                        processed = process_publication_data(article, remove_title_brackets=True)
+                        if processed:  # Only add if processing was successful
+                            pmid = next(iter(processed))  # Get the PMID key
+                            processed_articles[pmid] = processed[pmid]
+                    
+                    # Delete the file after successful processing
+                    try:
+                        os.remove(file_path)
+                        # print(f"Deleted {file_path} to save disk space")
+                    except Exception as e:
+                        print(f"Warning: Failed to delete {file_path}: {e}")
+                    
+                    pbar.update(1)
+            except Exception as e:
+                print(f"Error processing a file: {e}")
+                pbar.update(1)
+            completed_futures.append(future)
+        
+        # Use ThreadPoolExecutor for concurrent processing of this batch
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks to the executor for this batch
+            futures = []
+            for xml_file in batch_files:
+                future = executor.submit(parse_pubmed_file, str(xml_file))
+                future.add_done_callback(process_result)
+                futures.append(future)
+            
+            # Wait for all tasks to complete
+            for _ in concurrent.futures.as_completed(futures):
+                pass
+        
+        # Close the progress bar for this batch
+        pbar.close()
+        
+        # Save the batch data
+        batch_article_count = len(processed_articles)
+        total_processed_count += batch_article_count
+        
+        # Create a unique output filename for this batch
+        batch_output = output_dir / f"pubmed_articles_batch_{batch_num + 1:03d}.json"
+        
+        print(f"Batch {batch_num + 1} complete. Articles in this batch: {batch_article_count}")
+        save_to_json(processed_articles, batch_output)
     
-    # Close the progress bar
-    pbar.close()
-    
-    # Save the combined data
-    print(f"Processing complete. Total: {len(processed_articles)} articles")
-    save_to_json(processed_articles, article_output)
+    print(f"\nAll batches complete. Total articles processed: {total_processed_count}")
 
 if __name__ == "__main__":
     main()

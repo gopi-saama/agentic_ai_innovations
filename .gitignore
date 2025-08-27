@@ -1,3 +1,10 @@
 **/.DS_Store
 pubmed_baseline2025/*
 CTKG/*
+__pycache__/
+constructed_KG/
+constructed_KG_batch_059/
+dgraph_output/
+intermediate_parsed/
+nano-graphrag/
+processing_logs/
