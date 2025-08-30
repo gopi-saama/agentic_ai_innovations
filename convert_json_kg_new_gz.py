@@ -5,6 +5,10 @@ import hashlib
 import gzip
 import time  # Import time module for timing
 from tqdm import tqdm  # Import tqdm for progress tracking
+import multiprocessing as mp
+import glob
+import argparse
+from functools import partial
 
 def generate_deterministic_id(text):
     """
@@ -339,6 +343,192 @@ def process_pubmed_data(json_data):
     
     return nodes, relationships
 
+def process_pubmed_file(file_path, desc=None):
+    """
+    Process a single PubMed JSON file.
+    
+    Args:
+        file_path: Path to the gzipped JSON file to process
+        desc: Description for the tqdm progress bar
+    
+    Returns:
+        Tuple of (nodes, relationships) from the processed file
+    """
+    print(f"Processing file: {file_path}")
+    try:
+        with gzip.open(file_path, 'rt', encoding='utf-8') as file:
+            json_data = json.load(file)
+    except json.JSONDecodeError:
+        print(f"Error: Could not parse JSON from {file_path}")
+        return None
+    except Exception as e:
+        print(f"Error reading file {file_path}: {str(e)}")
+        return None
+    
+    print(f"Successfully loaded data from {file_path}")
+    print(f"Number of articles loaded: {len(json_data)}")
+    
+    # Process the data
+    return process_pubmed_data(json_data)
+
+def write_csv_files_for_file(nodes, relationships, output_dir_nodes, output_dir_rels, file_id):
+    """
+    Writes the provided nodes and relationships data to a set of CSV files for a single processed file.
+    
+    Args:
+        nodes: Dictionary of node types to node dictionaries
+        relationships: Dictionary of relationship types to lists of relationships
+        output_dir_nodes: Directory to write node CSV files
+        output_dir_rels: Directory to write relationship CSV files
+        file_id: Identifier for the file being processed (used in output filenames)
+    """
+    # Create file_id specific directories
+    file_nodes_dir = os.path.join(output_dir_nodes, file_id)
+    file_rels_dir = os.path.join(output_dir_rels, file_id)
+    
+    # Ensure directories exist
+    os.makedirs(file_nodes_dir, exist_ok=True)
+    os.makedirs(file_rels_dir, exist_ok=True)
+    
+    # Write node CSV files
+    for node_type, node_dict in nodes.items():
+        if not node_dict:
+            continue
+            
+        output_path = os.path.join(file_nodes_dir, f"{node_type.lower()}_nodes.csv")
+        
+        # Extract headers from the first node
+        headers = list(next(iter(node_dict.values())).keys())
+        
+        with open(output_path, 'w', newline='', encoding='utf-8') as file:
+            writer = csv.DictWriter(file, fieldnames=headers)
+            writer.writeheader()
+            
+            for node in node_dict.values():
+                writer.writerow(node)
+    
+    # Write relationship CSV files
+    for rel_type, rel_list in relationships.items():
+        if not rel_list:
+            continue
+            
+        output_path = os.path.join(file_rels_dir, f"{rel_type.lower()}_relationships.csv")
+        
+        # Extract headers from the first relationship
+        if rel_list:
+            headers = list(rel_list[0].keys())
+            
+            with open(output_path, 'w', newline='', encoding='utf-8') as file:
+                writer = csv.DictWriter(file, fieldnames=headers)
+                writer.writeheader()
+                
+                for rel in rel_list:
+                    writer.writerow(rel)
+
+def process_and_save_file(file_path, output_dirs):
+    """
+    Process a single PubMed file and save its results directly.
+    
+    Args:
+        file_path: Path to the gzipped JSON file to process
+        output_dirs: Dictionary containing output directories
+        
+    Returns:
+        Dict with statistics about the processed file
+    """
+    file_name = os.path.basename(file_path)
+    file_id = os.path.splitext(os.path.splitext(file_name)[0])[0]  # Remove both .json and .gz extensions
+    
+    try:
+        # Process the file
+        result = process_pubmed_file(file_path)
+        
+        if result is None:
+            print(f"Error processing file {file_path}")
+            return None
+            
+        nodes, relationships = result
+        
+        # Generate statistics for this file
+        file_node_count = sum(len(d) for d in nodes.values())
+        file_rel_count = sum(len(d) for d in relationships.values())
+        
+        print(f"\nFile {file_id} processed: {file_node_count} nodes, {file_rel_count} relationships")
+        
+        # Save results for this file
+        write_csv_files_for_file(
+            nodes, 
+            relationships, 
+            output_dirs['csv_nodes_dir'], 
+            output_dirs['csv_rels_dir'],
+            file_id
+        )
+        
+        print(f"Data for {file_id} saved to CSV files")
+        
+        # Return statistics
+        return {
+            'file_id': file_id,
+            'node_count': file_node_count,
+            'rel_count': file_rel_count,
+            'node_types': {node_type: len(nodes[node_type]) for node_type in nodes},
+            'rel_types': {rel_type: len(relationships[rel_type]) for rel_type in relationships}
+        }
+        
+    except Exception as e:
+        print(f"Error processing file {file_path}: {str(e)}")
+        return None
+
+def merge_data(results):
+    """
+    Merge multiple node and relationship dictionaries into a single set
+    
+    Args:
+        results: List of (nodes, relationships) tuples from processing multiple files
+    
+    Returns:
+        Tuple of merged (nodes, relationships)
+    """
+    # Initialize the merged dictionaries
+    merged_nodes = {
+        'Paper': {},
+        'Author': {},
+        'MeshTerm': {},
+        'PublicationType': {},
+        'Chemical': {},
+        'Keyword': {},
+        'Grant': {},
+        'Journal': {},
+        'Country': {}
+    }
+    
+    merged_relationships = {
+        'AUTHORED': [],
+        'HAS_MESH_TERM': [],
+        'HAS_PUBLICATION_TYPE': [],
+        'CONTAINS_CHEMICAL': [],
+        'HAS_KEYWORD': [],
+        'FUNDED_BY': [],
+        'PUBLISHED_IN': [],
+        'PUBLISHED_FROM': [],
+        'CITES': []
+    }
+    
+    # Merge all results
+    for nodes, relationships in results:
+        if nodes is None or relationships is None:
+            continue
+            
+        # Merge nodes
+        for node_type, node_dict in nodes.items():
+            merged_nodes[node_type].update(node_dict)
+        
+        # Merge relationships
+        for rel_type, rel_list in relationships.items():
+            merged_relationships[rel_type].extend(rel_list)
+    
+    return merged_nodes, merged_relationships
+
 def write_json_files(nodes, relationships, output_dir):
     """
     Writes the provided nodes and relationships data to a JSON file.
@@ -404,64 +594,79 @@ def main():
     """
     Main function to orchestrate the data processing and export.
     """
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Process PubMed files to build a knowledge graph.')
+    parser.add_argument('--input', '-i', type=str, default='/Users/gopinath.balu/Workspace/agentic_ai_innovations/intermediate_parsed',
+                        help='Input directory containing gzipped JSON files or path pattern (e.g., "/path/to/files/*.json.gz")')
+    parser.add_argument('--output', '-o', type=str, default='/Users/gopinath.balu/Workspace/agentic_ai_innovations/constructed_KG_new',
+                        help='Base output directory for processed data')
+    parser.add_argument('--workers', '-w', type=int, default=mp.cpu_count()//2,
+                        help='Number of worker processes for multiprocessing')
+    args = parser.parse_args()
+    
     start_time = time.time()
     
-    base_dir = "constructed_KG_batch_059"
+    # Setup output directories
+    base_dir = args.output
     json_dir = os.path.join(base_dir, "json")
     csv_dir = os.path.join(base_dir, "csv")
     csv_nodes_dir = os.path.join(csv_dir, "nodes")
     csv_rels_dir = os.path.join(csv_dir, "relationships")
-    input_file_path = "/Users/gopinath.balu/Workspace/agentic_ai_innovations/intermediate_parsed/pubmed_articles_batch_059.json.gz"
     
     for directory in [json_dir, csv_nodes_dir, csv_rels_dir]:
         os.makedirs(directory, exist_ok=True)
-
-    if not os.path.exists(input_file_path):
-        print(f"Error: Input file not found at {input_file_path}")
+    
+    # Create output directories dictionary to pass to process_and_save_file
+    output_dirs = {
+        'json_dir': json_dir,
+        'csv_nodes_dir': csv_nodes_dir,
+        'csv_rels_dir': csv_rels_dir
+    }
+    
+    # Find all input files
+    input_files = []
+    if os.path.isdir(args.input):
+        input_files = glob.glob(os.path.join(args.input, "*.json.gz"))
+    else:
+        input_files = glob.glob(args.input)
+    
+    if not input_files:
+        print(f"Error: No input files found matching {args.input}")
         return
     
-    print(f"Loading data from {input_file_path}...")
+    print(f"Found {len(input_files)} files to process")
+    
+    # Set up multiprocessing pool
+    pool = mp.Pool(processes=args.workers)
+    
+    # Process files in parallel with progress bar, one at a time
     try:
-        with gzip.open(input_file_path, 'rt', encoding='utf-8') as file:
-            json_data = json.load(file)
-    except json.JSONDecodeError:
-        print(f"Error: Could not parse JSON from {input_file_path}")
+        # Create partial function with fixed output_dirs parameter
+        process_func = partial(process_and_save_file, output_dirs=output_dirs)
+        
+        # Process and collect statistics for each file
+        file_stats = []
+        for stat in tqdm(pool.imap_unordered(process_func, input_files), 
+                         total=len(input_files), 
+                         desc="Processing files"):
+            if stat:
+                file_stats.append(stat)
+    finally:
+        pool.close()
+        pool.join()
+    
+    if not file_stats:
+        print("Error: No files were processed successfully.")
         return
-    except Exception as e:
-        print(f"Error reading file: {str(e)}")
-        return
     
-    print(f"Successfully loaded data from {input_file_path}")
-    print(f"Number of articles loaded: {len(json_data)}")
+    # Summarize the overall statistics
+    total_nodes = sum(stat['node_count'] for stat in file_stats)
+    total_relationships = sum(stat['rel_count'] for stat in file_stats)
     
-    print("Processing PubMed data...")
-    nodes, relationships = process_pubmed_data(json_data)
-    
-    total_nodes = sum(len(d) for d in nodes.values())
-    total_relationships = sum(len(d) for d in relationships.values())
-
     print("\n--- Knowledge Graph Summary ---")
-    print(f"Total number of nodes: {total_nodes}")
-    print(f"Total number of relationships: {total_relationships}")
-    
-    node_counts = {node_type: len(node_dict) for node_type, node_dict in nodes.items()}
-    
-    print("\n--- Node Distribution ---")
-    for node_type, count in node_counts.items():
-        print(f"{node_type}: {count} nodes")
-    
-    rel_counts = {rel_type: len(rel_list) for rel_type, rel_list in relationships.items()}
-    
-    print("\n--- Relationship Distribution ---")
-    for rel_type, count in rel_counts.items():
-        print(f"{rel_type}: {count} relationships")
-    
-    write_json_files(nodes, relationships, json_dir)
-    print(f"\nKnowledge graph saved to JSON file at: {os.path.join(json_dir, 'pubmed_knowledge_graph.json')}")
-
-    print("Writing CSV files...")
-    write_csv_files(nodes, relationships, csv_nodes_dir, csv_rels_dir)
-    print(f"Knowledge graph data saved to CSV files in: {csv_dir}")
+    print(f"Total number of nodes across all files: {total_nodes}")
+    print(f"Total number of relationships across all files: {total_relationships}")
+    print(f"Total number of files processed: {len(file_stats)}")
     
     end_time = time.time()
     print(f"\nTotal processing time: {end_time - start_time:.2f} seconds")
@@ -469,9 +674,7 @@ def main():
     print("\nKnowledge Graph generation completed successfully.")
 
 if __name__ == "__main__":
-    main()
-
-# Primary Keys for Each Node Type
+    main()# Primary Keys for Each Node Type
 # Node Type	        Primary Key (id field value)	                                
 # Paper	            Paper_{pmid}	                                                
 # Author	        Author_{deterministic_hash}	                                    
