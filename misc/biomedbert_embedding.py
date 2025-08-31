@@ -104,19 +104,20 @@ class SentenceEmbedder:
             print(f"Error calculating similarity: {e}")
             return None
 
-# Example usage (requires the 'embedder' object with a tokenizer from previous cells):
-embedder = SentenceEmbedder()
-sentences = [
-    "The patient presented with a severe pain in the chest.",
-    "The study investigated the effects of the new drug.",
-    "Biomedical natural language processing is a challenging task."
-]
-embeddings = embedder.encode(sentences)
-print("Embeddings shape:", embeddings.shape)
-print("Embeddings:", embeddings)
+if __name__ == "__main__":
+    # Example usage (requires the 'embedder' object with a tokenizer from previous cells):
+    embedder = SentenceEmbedder()
+    sentences = [
+        "The patient presented with a severe pain in the chest.",
+        "The study investigated the effects of the new drug.",
+        "Biomedical natural language processing is a challenging task."
+    ]
+    embeddings = embedder.encode(sentences)
+    print("Embeddings shape:", embeddings.shape)
+    print("Embeddings:", embeddings)
 
-# Example similarity calculation:
-sentence_a = "The patient has a high fever."
-sentence_b = "The person's temperature is elevated."
-similarity_score = embedder.get_similarity(sentence_a, sentence_b)
-print(f"Similarity between '{sentence_a}' and '{sentence_b}': {similarity_score}")
+    # Example similarity calculation:
+    sentence_a = "The patient has a high fever."
+    sentence_b = "The person's temperature is elevated."
+    similarity_score = embedder.get_similarity(sentence_a, sentence_b)
+    print(f"Similarity between '{sentence_a}' and '{sentence_b}': {similarity_score}")
